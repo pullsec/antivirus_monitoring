@@ -1,0 +1,17 @@
+# logs
+*.log
+
+# temp files
+*.tmp
+*.swp
+*~
+
+# system files
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+
+# env
+.env
