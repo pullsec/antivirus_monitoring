@@ -1,3 +1,17 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/status-production%20-brightgreen?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/type-monitoring%20tool-blue?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/shell-bash-lightgrey?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/integration-centreon-orange?style=for-the-badge" />
+  <img src="https://img.shields.io/github/license/Pr0xyG33k/antivirus_monitoring?style=for-the-badge" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/Pr0xyG33k/antivirus_monitoring/issues">Report Bug</a>
+  ·
+  <a href="https://github.com/Pr0xyG33k/antivirus_monitoring/pulls">Request Feature</a>
+</p>
+
 <!-- TABLE OF CONTENTS -->
 <details>
   <summary>Table of Contents</summary>
