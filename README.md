@@ -1,3 +1,5 @@
+# AV Supervision Toolkit
+
 <!-- TABLE OF CONTENTS -->
 <details>
   <summary>Table of Contents</summary>
@@ -28,11 +30,11 @@ This architecture is designed for segmented environments where direct access bet
 
 ```mermaid
 flowchart LR
-    A[Centreon Poller<br/>snmp.sh]
+    A[Centreon Poller<br/>av_snmp.sh]
     B[Jump Server<br/>snmpd + extend]
-    C[check.sh]
+    C[av_relay.sh]
     D[AV Server]
-    E[supervision.sh]
+    E[av_supervision.sh]
 
     A -->|SNMP request| B
     B -->|extend execution| C
@@ -43,123 +45,106 @@ flowchart LR
 ```
 
 ## scripts
-The project is composed of multiple scripts distributed across different hosts,
-each script has a specific role in the monitoring chain:
 
+The project is composed of multiple scripts distributed across different hosts.  
+Each script has a specific role in the monitoring chain.
 
 | script | location | role | description |
 |--------|----------|------|------------|
-| supervision.sh | av server | check | validates antivirus signatures and engines |
-| check.sh | jump server | relay | executes remote script via SSH |
-| snmp.sh | centreon poller | entrypoint | queries SNMP and retrieves result |
+| av_supervision.sh | av server | check | validates antivirus signatures and engines |
+| av_relay.sh | jump server | relay | executes remote script via SSH |
+| av_snmp.sh | centreon poller | entrypoint | queries SNMP and retrieves result |
 
 These scripts work together to provide a complete monitoring workflow across segmented environments.
 
 ## installation
 
 ### 1. clone repository
-Clone the repository on each host where scripts are required.
 
-```
-git clone https://github.com/Pr0xyG33k/AV-Supervision.git
-cd AV-Supervision
+```bash
+git clone https://github.com/Pr0xyG33k/antivirus_monitoring.git
+cd antivirus_monitoring
 ```
 
 ### 2. av server
-The AV server is responsible for executing the actual antivirus checks.
 
-```
-cp supervision.sh /opt/av-supervision/
-chmod +x /opt/av-supervision/supervision.sh
+```bash
+cp av_supervision.sh /opt/antivirus_monitoring/
+chmod +x /opt/antivirus_monitoring/av_supervision.sh
 ```
 
 ### 3. jump server
-The jump server acts as an intermediary between the monitoring system and the AV server.
 
-```
-cp check.sh /usr/lib/centreon/plugins/
-chmod +x /usr/lib/centreon/plugins/check.sh
+```bash
+cp av_relay.sh /usr/lib/centreon/plugins/
+chmod +x /usr/lib/centreon/plugins/av_relay.sh
 ```
 
-```
-extend check /usr/lib/centreon/plugins/check.sh
+```bash
+extend check /usr/lib/centreon/plugins/av_relay.sh
 systemctl restart snmpd
 ```
 
 ### 4. ssh configuration
-The jump server must be able to connect to the AV server without user interaction.
 
-```
+```bash
 ssh-keygen
 ssh-copy-id user@av-server
 ```
 
 ### 5. centreon poller
-The poller is responsible for initiating the monitoring request.
 
-```
-cp snmp.sh /usr/lib/centreon/plugins/
-chmod +x /usr/lib/centreon/plugins/snmp.sh
+```bash
+cp av_snmp.sh /usr/lib/centreon/plugins/
+chmod +x /usr/lib/centreon/plugins/av_snmp.sh
 ```
 
 ### 6. test
-Before integrating into Centreon, validate the full chain manually.
 
-```
-./snmp.sh <jump_server> <community> check
+```bash
+./av_snmp.sh <jump_server> <community> check
 ```
 
 ## usage
 
-The monitoring workflow is initiated from the Centreon poller using the SNMP check script.
 > [!NOTE]
 The poller does not execute the antivirus check directly.  
-The request is forwarded via SNMP to the jump server, which executes the check remotely over 
+The request is forwarded via SNMP to the jump server, which executes `av_supervision.sh` remotely over SSH.
 
 ### command
 
-`<jump_server>`: IP or hostname of the jump server  
-`<community>`: SNMP community string  
-`check`: SNMP extend identifier  
+```bash
+./av_snmp.sh <jump_server> <community> check
+```
 
-### options
-
-The actual antivirus checks are performed by `supervision.sh` on the AV server,
-the following options apply to this script:
+### options (av_supervision.sh)
 
 `-w <int>`   warning threshold (default: 0)  
 `-c <int>`   critical threshold (default: 1)  
-`t <int>`   HTTP timeout in seconds (default: 15)  
+`-t <int>`   HTTP timeout in seconds (default: 15)  
 `-u <url>`   override update URL (default: auto)  
 `-b <path>`  base directory for antivirus engines  
 `-l <path>`  log directory  
 `-v`         enable verbose mode  
 `-h`         display help  
 
-### code
+### return codes
 
-The scripts follow the standard Nagios/Centreon plugin convention,
-exit codes are interpreted as follows:
-
-`0`   **OK**        system up to date  
-`1`   **WARNING**   threshold exceeded (definitions or engines)  
-`2`   **CRITICAL**  outdated or invalid antivirus components  
-`3`   **UNKNOWN**   script execution failure or misconfiguration  
+`0` OK  
+`1` WARNING  
+`2` CRITICAL  
+`3` UNKNOWN  
 
 ## faq
 
 ### why use a jump server instead of direct monitoring?
-Direct access to the AV server is restricted due to network segmentation,
-the jump server acts as a controlled relay between SNMP and SSH.
+Direct access is restricted due to network segmentation.
 
 ### why use snmp extend?
-SNMP extend allows remote command execution through SNMP,
-making it compatible with Centreon without requiring direct SSH access.
+Allows execution of remote scripts via SNMP.
 
 ### why is SSH required?
-The AV server is not directly reachable from the poller,
-SSH is used by the jump server to securely execute the check remotely.
+Used by the jump server to reach the AV server.
 
 ### why is only the exit code used?
-Centreon determines the service state exclusively from the script exit code,
-the output message is only used for display.
+Centreon determines the status based on exit code only.
