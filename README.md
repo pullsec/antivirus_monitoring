@@ -17,11 +17,15 @@
 
 ## about
 
-AV Supervision Toolkit is an antivirus monitoring solution designed for restricted and segmented environments where the Centreon poller cannot directly reach the AV server.
+AV Supervision Toolkit is based on a real-world enterprise scenario involving secure antivirus update distribution in a segmented environment.
+In this context, systems responsible for delivering antivirus updates were isolated from the monitoring infrastructure, requiring a controlled mechanism to verify update integrity and availability.
 
-- isolated AV server  
-- jump server (bastion)  
-- indirect supervision via SNMP and SSH  
+This project focuses on ensuring:
+- successful delivery of antivirus updates
+- validation of definitions and engine freshness
+- reliable monitoring despite network segmentation
+
+The solution reflects operational constraints typically found in sensitive environments, where direct access is restricted and secure relay mechanisms are required.
 
 ## architecture
 
