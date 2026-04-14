@@ -12,7 +12,7 @@
 #     - Output formatting for Centreon (stdout + exit code)
 #
 # Architecture:
-#   AV Server → SSH (jump) → SNMP → Poller → Centreon
+#   AV Server -> SSH (jump) -> SNMP -> Poller -> Centreon
 #
 # Notes:
 #   - Designed for segmented environments (no direct access)
@@ -21,6 +21,21 @@
 #
 # Environment:
 #   Debian / Ubuntu
+#
+# Rework / fixes done:
+#   - proper bash strict mode
+#   - lock to avoid concurrent execution
+#   - better debug / verbose logging
+#   - MANIFEST parsing fix:
+#       timestamp not assumed to be on first line anymore
+#   - aligned logic for defs and engines:
+#       > 24h => WARNING
+#       > 48h => CRITICAL
+#   - enriched Centreon output with explicit WARNING / CRITICAL details
+#
+# Known limitation:
+#   - defs source seems to expose only a date (YYYY-MM-DD) and not a full time
+#   - so for defs we evaluate age from 00:00:00 of that day
 ######################################
 
 set -o errexit
@@ -29,7 +44,7 @@ set -o pipefail
 IFS=$'\n\t'
 
 #######################################
-# Codes Centreon
+# Codes Centreon / Nagios
 #######################################
 OK=0
 WARNING=1
@@ -44,15 +59,14 @@ UNKNOWN=3
 SCRIPT_NAME="$(basename "$0")"
 SRV="$(hostname -s 2>/dev/null || hostname)"
 
-# Seuils: 
-# - warning si total > WARNING_THRESHOLD
-# - critical si total > CRITICAL_THRESHOLD
-WARNING_THRESHOLD=0
-CRITICAL_THRESHOLD=1
+# Common freshness thresholds
+WARNING_SECONDS=$((24 * 3600))
+CRITICAL_SECONDS=$((48 * 3600))
 
 CURL_TIMEOUT=15
 BASE_AV_DIR="/path/path/path/path/path/av"
 LOG_DIR="/path/path/log"
+LOG_FILE=""
 
 # Debug
 VERBOSE=0
@@ -65,10 +79,15 @@ URL_PATH2="x.x-enka-antivirus.tar/"
 WORD_KEY="enka"
 INTEGRATION_SERVER="server4"
 
-# fix: on ne recupere plus via $(fonction), 
-# on recupere des variables globales pour conserver les logs verboses
+# Global counters kept for display/debug
 DEF_COUNT=0
 ENGINE_COUNT=0
+
+# Severity counters
+DEF_WARNING_COUNT=0
+DEF_CRITICAL_COUNT=0
+ENGINE_WARNING_COUNT=0
+ENGINE_CRITICAL_COUNT=0
 
 #######################################
 # Mapping
@@ -80,9 +99,12 @@ declare -A SERVERS_URLS=(
   ["server4"]="https://path/download/update/"
   ["server5"]="https://path/download/update/"
   ["server6"]="https://path/download/update/"
-
 )
 
+# Detail arrays.
+# Format kept intentionally human-readable:
+#   name:date:WARNING
+#   name:date:CRITICAL
 declare -a OUTDATED_DEFS=()
 declare -a OUTDATED_ENGINES=()
 
@@ -94,8 +116,6 @@ usage() {
 Usage: $SCRIPT_NAME [options]
 
 Options:
-  -w <int>    seuil warning (default: 0)
-  -c <int>    seuil critical (default: 0)
   -t <int>    timeout curl en secondes (default: 15)
   -u <url>    URL force (debug/test uniquement)
   -b <path>   repertoire base des engines
@@ -115,7 +135,7 @@ EOF
 # Logging
 #######################################
 
-# verbose sur stderr, pour ne pas polluer le message plugin
+# verbose on stderr to avoid polluting plugin stdout
 log() {
   local msg="$*"
 
@@ -136,7 +156,7 @@ init_log() {
 }
 
 #######################################
-# Fonctions
+# Helper functions
 #######################################
 die() {
   local code="$1"
@@ -159,17 +179,34 @@ validate_url() {
 
 cleanup_old_logs() {
   if [[ -n "$LOG_DIR" && -d "$LOG_DIR" ]]; then
-    find "$LOG_DIR" -type f -name "${SCRIPT_NAME}_*" -mtime +15 -delete 2>/dev/null || true
+    find "$LOG_DIR" -type f -name "supervision_*" -mtime +15 -delete 2>/dev/null || true
+  fi
+}
+
+#######################################
+# Age classification
+#######################################
+# Shared logic for defs and engines:
+#   <= 24h => OK
+#   > 24h  => WARNING
+#   > 48h  => CRITICAL
+classify_age() {
+  local age_seconds="$1"
+
+  if (( age_seconds > CRITICAL_SECONDS )); then
+    echo "CRITICAL"
+  elif (( age_seconds > WARNING_SECONDS )); then
+    echo "WARNING"
+  else
+    echo "OK"
   fi
 }
 
 #######################################
 # Args
 #######################################
-while getopts ":w:c:t:u:b:l:vh" opt; do
+while getopts ":t:u:b:l:vh" opt; do
   case "$opt" in
-    w) WARNING_THRESHOLD="$OPTARG" ;;
-    c) CRITICAL_THRESHOLD="$OPTARG" ;;
     t) CURL_TIMEOUT="$OPTARG" ;;
     u) URL_OVERRIDE="$OPTARG" ;;
     b) BASE_AV_DIR="$OPTARG" ;;
@@ -182,17 +219,9 @@ while getopts ":w:c:t:u:b:l:vh" opt; do
 done
 
 #######################################
-# Controles arguments
+# Argument checks
 #######################################
-
-# fix: on evite les erreurs de saisie des le demarrage
-validate_number "$WARNING_THRESHOLD" || die "$UNKNOWN" "UNKNOWN: warning threshold invalide"
-validate_number "$CRITICAL_THRESHOLD" || die "$UNKNOWN" "UNKNOWN: critical threshold invalide"
 validate_number "$CURL_TIMEOUT" || die "$UNKNOWN" "UNKNOWN: timeout invalide"
-
-if (( WARNING_THRESHOLD > CRITICAL_THRESHOLD )); then
-  die "$UNKNOWN" "UNKNOWN: warning threshold > critical threshold"
-fi
 
 if [[ -n "$URL_OVERRIDE" ]]; then
   validate_url "$URL_OVERRIDE" || die "$UNKNOWN" "UNKNOWN: URL override invalide"
@@ -204,7 +233,8 @@ fi
 init_log
 trap cleanup_old_logs EXIT
 
-# fix: evite une deuxieme execution ecrase le contexte de la premiere
+# Fix:
+# avoid a second execution interfering with the first one
 LOCK_FILE="/tmp/${SCRIPT_NAME}.lock"
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
@@ -227,11 +257,13 @@ get_url() {
   echo "${SERVERS_URLS[$SRV]}"
 }
 
-# fix: data http
-#     - curl -> timeout
-#     - fail sur erreur http
-#     - concatenation 2 sources dans un fichier temporaire 
-# recuperation des donnees defs via HTTP
+#######################################
+# HTTP defs retrieval
+#######################################
+# Notes:
+#   - curl timeout kept explicit
+#   - fail on HTTP error
+#   - both sources are concatenated in a temp file
 fetch_data() {
   local url="$1"
   local tmp="$2"
@@ -245,7 +277,11 @@ fetch_data() {
   curl -fsS --connect-timeout 5 --max-time "$CURL_TIMEOUT" "${url}${URL_PATH2}" >> "$tmp"
 }
 
-# depend du format de la page (parsings des desfs)
+#######################################
+# Defs parsing
+#######################################
+# Still depends on the actual HTML / directory listing format.
+# Kept simple on purpose for now.
 parse_data() {
   local file="$1"
 
@@ -258,63 +294,83 @@ parse_data() {
 #######################################
 # Check defs
 #######################################
-
-#Comparaison base sur la date du jour, 
-#les mise a jours sont frequentes (plusieurs fois/jours)
-
-# fix : fonction qui ne retourne plus le compteur via echo
+# Current business logic:
+#   - defs freshness based on age
+#   - source only gives YYYY-MM-DD
+#   - age therefore computed from YYYY-MM-DD 00:00:00
 check_defs() {
   local data="$1"
-  local today
-  today="$(date '+%Y-%m-%d')"
+  local now_ts
+  now_ts="$(date +%s)"
 
   DEF_COUNT=0
+  DEF_WARNING_COUNT=0
+  DEF_CRITICAL_COUNT=0
   OUTDATED_DEFS=()
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
 
-    local name date_found
+    local name date_found date_ts age status
     name="$(awk '{print $1}' <<< "$line")"
     date_found="$(awk '{print $2}' <<< "$line")"
 
     if [[ -z "$name" || -z "$date_found" ]]; then
-      log "DEF ignorée (ligne illisible): $line"
+      log "DEF ignoree (ligne illisible): $line"
       continue
     fi
 
-    if [[ "$date_found" != "$today" ]]; then
+    # If the source date cannot be parsed, keep it critical.
+    if ! date_ts="$(date -d "${date_found} 00:00:00" +%s 2>/dev/null)"; then
+      ((DEF_CRITICAL_COUNT+=1))
       ((DEF_COUNT+=1))
-      OUTDATED_DEFS+=("${name}:${date_found}")
-      log "OUTDATED DEF: ${name} (${date_found})"
-    else
-      log "DEF OK: ${name} (${date_found})"
+      OUTDATED_DEFS+=("${name}:${date_found}:CRITICAL")
+      log "DEF CRITICAL: ${name} (${date_found}) date invalide"
+      continue
     fi
+
+    age=$((now_ts - date_ts))
+    status="$(classify_age "$age")"
+
+    case "$status" in
+      OK)
+        log "DEF OK: ${name} (${date_found}) age=${age}s"
+        ;;
+      WARNING)
+        ((DEF_WARNING_COUNT+=1))
+        ((DEF_COUNT+=1))
+        OUTDATED_DEFS+=("${name}:${date_found}:WARNING")
+        log "DEF WARNING: ${name} (${date_found}) age=${age}s"
+        ;;
+      CRITICAL)
+        ((DEF_CRITICAL_COUNT+=1))
+        ((DEF_COUNT+=1))
+        OUTDATED_DEFS+=("${name}:${date_found}:CRITICAL")
+        log "DEF CRITICAL: ${name} (${date_found}) age=${age}s"
+        ;;
+    esac
   done <<< "$data"
 }
 
 #######################################
-# Check engines 
-######################################
-
-# tolerence de  48h , 
-# verifie les les moteurs via le ficheirs MANIFEST
-
-#extraction timestamp present sur le MANIFEST, puis selection du plus recent
-
-# fix: avant on prenais head -1 ou tail -1 mais le timestamp  etais aleatoire
-#      evite les erreurs liees a l'ordre de ligne 
+# Check engines
+#######################################
+# Notes:
+#   - MANIFEST timestamp is not assumed to be on first line anymore
+#   - we extract all timestamps and keep the newest one
 check_engines() {
   ENGINE_COUNT=0
+  ENGINE_WARNING_COUNT=0
+  ENGINE_CRITICAL_COUNT=0
   OUTDATED_ENGINES=()
 
   [[ -d "$BASE_AV_DIR" ]] || die "$UNKNOWN" "UNKNOWN: repertoire absent: $BASE_AV_DIR"
 
-  local threshold_date
-  threshold_date="$(date --date='2 day ago' '+%Y%m%d')"
+  local now_ts
+  now_ts="$(date +%s)"
 
   local d
-# fix: L'option de shell nullglob controle le Bash mappe les motifs glob qui ne correspondent pas
+  # nullglob avoids treating unmatched globs as raw strings
   shopt -s nullglob
   for d in "$BASE_AV_DIR"/*; do
     [[ -d "$d" ]] || continue
@@ -322,12 +378,13 @@ check_engines() {
     local engine
     engine="$(basename "$d")"
 
-    # Adapter ce chemin si nécessaire
+    # Adjust this path if needed in your environment
     local manifest="${d}/path/MANIFEST.txt"
 
     if [[ ! -f "$manifest" ]]; then
       log "ENGINE ${engine}: manifest absent (${manifest})"
-      OUTDATED_ENGINES+=("${engine}:manifest_absent")
+      OUTDATED_ENGINES+=("${engine}:manifest_absent:CRITICAL")
+      ((ENGINE_CRITICAL_COUNT+=1))
       ((ENGINE_COUNT+=1))
       continue
     fi
@@ -342,30 +399,42 @@ check_engines() {
 
     if [[ -z "$ts" ]]; then
       log "ENGINE ${engine}: aucun timestamp exploitable"
-      OUTDATED_ENGINES+=("${engine}:timestamp_introuvable")
+      OUTDATED_ENGINES+=("${engine}:timestamp_introuvable:CRITICAL")
+      ((ENGINE_CRITICAL_COUNT+=1))
       ((ENGINE_COUNT+=1))
       continue
     fi
 
     if [[ ! "$ts" =~ ^[0-9]+$ ]]; then
       log "ENGINE ${engine}: timestamp invalide (${ts})"
-      OUTDATED_ENGINES+=("${engine}:timestamp_invalide")
+      OUTDATED_ENGINES+=("${engine}:timestamp_invalide:CRITICAL")
+      ((ENGINE_CRITICAL_COUNT+=1))
       ((ENGINE_COUNT+=1))
       continue
     fi
 
-    local date_found
-    date_found="$(date -d "@$ts" '+%Y%m%d')"
+    local date_found age status
+    date_found="$(date -d "@$ts" '+%Y-%m-%d %H:%M:%S')"
+    age=$((now_ts - ts))
+    status="$(classify_age "$age")"
 
-    log "ENGINE ${engine}: ts=${ts}, date=${date_found}, threshold=${threshold_date}"
-
-    if [[ "$date_found" -lt "$threshold_date" ]]; then
-      log "ENGINE ${engine}: obsolete (${date_found})"
-      OUTDATED_ENGINES+=("${engine}:${date_found}")
-      ((ENGINE_COUNT+=1))
-    else
-      log "ENGINE ${engine}: OK (${date_found})"
-    fi
+    case "$status" in
+      OK)
+        log "ENGINE OK: ${engine} (${date_found}) age=${age}s"
+        ;;
+      WARNING)
+        ((ENGINE_WARNING_COUNT+=1))
+        ((ENGINE_COUNT+=1))
+        OUTDATED_ENGINES+=("${engine}:${date_found}:WARNING")
+        log "ENGINE WARNING: ${engine} (${date_found}) age=${age}s"
+        ;;
+      CRITICAL)
+        ((ENGINE_CRITICAL_COUNT+=1))
+        ((ENGINE_COUNT+=1))
+        OUTDATED_ENGINES+=("${engine}:${date_found}:CRITICAL")
+        log "ENGINE CRITICAL: ${engine} (${date_found}) age=${age}s"
+        ;;
+    esac
   done
   shopt -u nullglob
 }
@@ -373,47 +442,38 @@ check_engines() {
 #######################################
 # Build status
 #######################################
-
-# determine le status final plugin (OK/WARNING/CRITICAL)
-# en fonction des annomalie detectes
-# CENTREON se base uniquement sur celle -ci
-
+# Final status is severity-based now:
+#   - at least one CRITICAL => CRITICAL
+#   - else at least one WARNING => WARNING
+#   - else OK
+#
+# Integration server kept softer on purpose.
 build_status() {
-  local total="$1"
-
   if [[ "$SRV" == "$INTEGRATION_SERVER" ]]; then
-    if (( total == 0 )); then
+    if (( DEF_WARNING_COUNT == 0 && DEF_CRITICAL_COUNT == 0 && ENGINE_WARNING_COUNT == 0 && ENGINE_CRITICAL_COUNT == 0 )); then
       PLUGIN_STATUS="OK"
       PLUGIN_CODE=$OK
-      return 0
-    fi
-
-    if (( total > CRITICAL_THRESHOLD )); then
+    else
       PLUGIN_STATUS="WARNING"
       PLUGIN_CODE=$WARNING
-      return 0
     fi
-
-    if (( total > WARNING_THRESHOLD )); then
-      PLUGIN_STATUS="WARNING"
-      PLUGIN_CODE=$WARNING
-      return 0
-    fi
+    return 0
   fi
 
-  if (( total == 0 )); then
-    PLUGIN_STATUS="OK"
-    PLUGIN_CODE=$OK
-  elif (( total > CRITICAL_THRESHOLD )); then
+  if (( DEF_CRITICAL_COUNT > 0 || ENGINE_CRITICAL_COUNT > 0 )); then
     PLUGIN_STATUS="CRITICAL"
     PLUGIN_CODE=$CRITICAL
-  elif (( total > WARNING_THRESHOLD )); then
+    return 0
+  fi
+
+  if (( DEF_WARNING_COUNT > 0 || ENGINE_WARNING_COUNT > 0 )); then
     PLUGIN_STATUS="WARNING"
     PLUGIN_CODE=$WARNING
-  else
-    PLUGIN_STATUS="OK"
-    PLUGIN_CODE=$OK
+    return 0
   fi
+
+  PLUGIN_STATUS="OK"
+  PLUGIN_CODE=$OK
 }
 
 #######################################
@@ -428,7 +488,7 @@ main() {
 
   local tmp
   tmp="$(mktemp)"
-# fix: le fichier temporaire est supprime en sortie
+  # temp file is cleaned on exit
   trap 'rm -f "$tmp"; cleanup_old_logs' EXIT
 
   fetch_data "$url" "$tmp" || die "$CRITICAL" "CRITICAL: echec recuperation HTTP"
@@ -444,36 +504,47 @@ main() {
   defs="${DEF_COUNT:-0}"
   engines="${ENGINE_COUNT:-0}"
 
-  local total=0
-  total=$((defs + engines))
+  build_status
 
-  build_status "$total"
-
-# perfdata centreon a ajouter si necessaire 
-#| defs=${defs} engines=${engines}
-#  echo ${PLUGIN_STATUS}: defs=${defs}, engines=${engines} 
-
-# Fournir le diagnostique directement  exploitable
-# pas de necessite connexion SSH
+  # Human-readable Centreon message
+  local MSG
   MSG="${PLUGIN_STATUS}: defs=${defs}, engines=${engines}"
 
-  if ((defs > 0 )); then
-    printf -v DEF_STR "%s, ""${OUTDATED_DEFS[@]}"
-    DEF_STR="${DEF_STR%, }"
-    MSG+=" | Defs KO: ${DEF_STR}"
-  fi
+  local DEF_WARN_STR=""
+  local DEF_CRIT_STR=""
+  local ENG_WARN_STR=""
+  local ENG_CRIT_STR=""
 
-  if ((engines > 0 )); then
-    printf -v ENG_STR "%s, ""${OUTDATED_ENGINES[@]}"
-    ENG_STR="${ENG_STR%, }"
-    MSG+=" | Engines KO: ${ENG_STR}"
-  fi
- 
-# label=value;warn;crit;min
-# permet l'exploitation dans centreon (graph/historique)
+  local d
+  for d in "${OUTDATED_DEFS[@]}"; do
+    if [[ "$d" == *":WARNING" ]]; then
+      DEF_WARN_STR+="${d}, "
+    elif [[ "$d" == *":CRITICAL" ]]; then
+      DEF_CRIT_STR+="${d}, "
+    fi
+  done
 
-   echo "$MSG | defs=${defs};1;2;0
-   engines=${engines};1;2;0"
+  local e
+  for e in "${OUTDATED_ENGINES[@]}"; do
+    if [[ "$e" == *":WARNING" ]]; then
+      ENG_WARN_STR+="${e}, "
+    elif [[ "$e" == *":CRITICAL" ]]; then
+      ENG_CRIT_STR+="${e}, "
+    fi
+  done
+
+  DEF_WARN_STR="${DEF_WARN_STR%, }"
+  DEF_CRIT_STR="${DEF_CRIT_STR%, }"
+  ENG_WARN_STR="${ENG_WARN_STR%, }"
+  ENG_CRIT_STR="${ENG_CRIT_STR%, }"
+
+  [[ -n "$DEF_WARN_STR" ]] && MSG+=" | Defs WARNING: ${DEF_WARN_STR}"
+  [[ -n "$DEF_CRIT_STR" ]] && MSG+=" | Defs CRITICAL: ${DEF_CRIT_STR}"
+  [[ -n "$ENG_WARN_STR" ]] && MSG+=" | Engines WARNING: ${ENG_WARN_STR}"
+  [[ -n "$ENG_CRIT_STR" ]] && MSG+=" | Engines CRITICAL: ${ENG_CRIT_STR}"
+
+  # Perfdata kept for Centreon graph / history
+  echo "$MSG | defs=${defs};1;2;0 engines=${engines};1;2;0"
 
   if [[ "$VERBOSE" -eq 1 ]]; then
     if (( ${#OUTDATED_DEFS[@]} > 0 )); then
@@ -487,9 +558,7 @@ main() {
     fi
   fi
 
-# le code retour determine le status CENTREON,
-# le message seul n'est pas utilise pour le status
-
+  # Exit code is what Centreon really uses for status
   log "Fin ${SCRIPT_NAME} sur ${SRV} (${PLUGIN_STATUS})"
   exit "$PLUGIN_CODE"
 }
