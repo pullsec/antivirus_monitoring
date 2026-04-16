@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/status-production%20-brightgreen?style=for-the-badge" />
   <img src="https://img.shields.io/badge/type-monitoring%20-blue?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/lang-bash-lightgrey?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Bash-4EAA25?style=for-the-badge&logo=gnubash&logoColor=white" />
   <img src="https://img.shields.io/badge/tests-passing-brightgreen?style=for-the-badge" />
   <img src="https://img.shields.io/github/license/Pr0xyG33k/antivirus_monitoring?style=for-the-badge" />
 </p>
