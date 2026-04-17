@@ -1,15 +1,15 @@
 <p align="center">
   <img src="https://img.shields.io/badge/status-production%20-brightgreen?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/type-monitoring%20-blue?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/type-monitoring%20-critical?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Bash-4EAA25?style=for-the-badge&logo=gnubash&logoColor=white" />
   <img src="https://img.shields.io/badge/tests-passing-brightgreen?style=for-the-badge" />
-  <img src="https://img.shields.io/github/license/Pr0xyG33k/antivirus_monitoring?style=for-the-badge" />
+  <img src="https://img.shields.io/github/license/pullsec/antivirus_monitoring?style=for-the-badge" />
 </p>
 
 <p align="center">
-  <a href="https://github.com/Pr0xyG33k/antivirus_monitoring/issues">Report Bug</a>
+  <a href="https://github.com/pullsec/antivirus_monitoring/issues">Report Bug</a>
   ·
-  <a href="https://github.com/Pr0xyG33k/antivirus_monitoring/pulls">Request Feature</a>
+  <a href="https://github.com/pullsec/antivirus_monitoring/pulls">Request Feature</a>
 </p>
 
 <!-- TABLE OF CONTENTS -->
