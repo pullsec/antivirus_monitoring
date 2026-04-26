@@ -1,97 +1,124 @@
 #!/usr/bin/env bash
 
-######################################
-# Name: av_supervision.sh
-# Description:
-#   Antivirus supervision script used by Centreon.
+###############################################################################
+# Script: av_supervision.sh
 #
-#   This script performs:
-#     - HTTP checks for AV definitions
-#     - Local parsing of AV engine MANIFEST files
-#     - Threshold evaluation (warning / critical)
-#     - Output formatting for Centreon (stdout + exit code)
+# Purpose:
+#   Local antivirus supervision script executed on each AV server.
+#
+# Role:
+#   - checks antivirus definitions through HTTP content
+#   - checks antivirus engines through local MANIFEST files
+#   - evaluates WARNING / CRITICAL thresholds
+#   - returns Centreon/Nagios-compatible output
 #
 # Architecture:
-#   AV Server -> SSH (jump) -> SNMP -> Poller -> Centreon
+#   AV Server -> SSH from jump server -> SAVI aggregation -> SNMP extend -> Poller
 #
 # Notes:
-#   - Designed for segmented environments (no direct access)
-#   - Output must follow Nagios/Centreon plugin format
-#   - Exit code is critical (message is secondary)
+#   - This script runs locally on the AV servers.
+#   - It must return a valid Centreon plugin output:
+#       STATUS: message | perfdata
+#   - The exit code is the real status used by Centreon.
 #
-# Environment:
-#   Debian / Ubuntu
+# History / Fixes:
+#   - v1: initial local AV check
+#   - v2: added strict bash mode
+#   - v3: FIX: added lock file to avoid overlapping executions
+#   - v4: FIX: added curl timeout and HTTP error handling
+#   - v5: FIX: improved HTML parsing for definitions
+#   - v6: FIX: definitions now use age-based logic (>24h / >48h)
+#   - v7: FIX: engines MANIFEST parsing no longer assumes timestamp position
+#   - v8: FIX: newest timestamp is selected when several timestamps exist
+#   - v9: improved output with detailed WARNING / CRITICAL sections
+#   - v10: FIX: business logic priority order corrected
 #
-# Rework / fixes done:
-#   - proper bash strict mode
-#   - lock to avoid concurrent execution
-#   - better debug / verbose logging
-#   - MANIFEST parsing fix:
-#       timestamp not assumed to be on first line anymore
-#   - aligned logic for defs and engines:
-#       > 24h => WARNING
-#       > 48h => CRITICAL
-#   - enriched Centreon output with explicit WARNING / CRITICAL details
+# Business rules:
+#   Definitions:
+#     - age <= 24h  => OK
+#     - age > 24h   => WARNING
+#     - age > 48h   => CRITICAL
 #
-# Known limitation:
-#   - defs source seems to expose only a date (YYYY-MM-DD) and not a full time
-#   - so for defs we evaluate age from 00:00:00 of that day
-######################################
+#   Engines:
+#     - age <= 24h  => OK
+#     - age > 24h   => WARNING
+#     - age > 48h   => CRITICAL
+#
+#   Final status:
+#     - any defs CRITICAL          => CRITICAL
+#     - 4+ engines CRITICAL        => CRITICAL
+#     - any defs WARNING           => WARNING
+#     - any remaining engine issue => WARNING
+#     - otherwise                  => OK
+###############################################################################
 
 set -o errexit
 set -o nounset
 set -o pipefail
 IFS=$'\n\t'
 
-#######################################
-# Codes Centreon / Nagios
-#######################################
+###############################################################################
+# Centreon / Nagios return codes
+###############################################################################
 OK=0
 WARNING=1
 CRITICAL=2
 UNKNOWN=3
 
-#######################################
+###############################################################################
 # Defaults
-#######################################
-
-# Init
+###############################################################################
 SCRIPT_NAME="$(basename "$0")"
 SRV="$(hostname -s 2>/dev/null || hostname)"
 
-# Common freshness thresholds
+# Shared age thresholds for definitions and engines.
 WARNING_SECONDS=$((24 * 3600))
 CRITICAL_SECONDS=$((48 * 3600))
 
+# HTTP timeout.
+# FIX:
+#   Prevents Centreon checks from hanging indefinitely.
 CURL_TIMEOUT=15
+
+# Local AV engines base directory.
 BASE_AV_DIR="/path/path/path/path/path/av"
+
+# Local logs.
 LOG_DIR="/path/path/log"
 LOG_FILE=""
 
-# Debug
+# Verbose mode is disabled by default to avoid polluting Centreon output.
 VERBOSE=0
 
-# URL test/debug
+# Optional URL override for debug / testing.
 URL_OVERRIDE=""
 
+# HTTP paths used to retrieve definition information.
 URL_PATH1="x.x-enka-antivirus/"
 URL_PATH2="x.x-enka-antivirus.tar/"
 WORD_KEY="enka"
+
+# Optional integration server exception.
+# Set to empty string if not used.
 INTEGRATION_SERVER="server4"
 
-# Global counters kept for display/debug
+###############################################################################
+# Global counters
+###############################################################################
 DEF_COUNT=0
 ENGINE_COUNT=0
 
-# Severity counters
 DEF_WARNING_COUNT=0
 DEF_CRITICAL_COUNT=0
 ENGINE_WARNING_COUNT=0
 ENGINE_CRITICAL_COUNT=0
 
-#######################################
-# Mapping
-#######################################
+declare -a OUTDATED_DEFS=()
+declare -a OUTDATED_ENGINES=()
+
+###############################################################################
+# Hostname -> Update URL mapping
+###############################################################################
 declare -A SERVERS_URLS=(
   ["server1"]="https://path/download/update/"
   ["server2"]="https://path/download/update/"
@@ -101,29 +128,22 @@ declare -A SERVERS_URLS=(
   ["server6"]="https://path/download/update/"
 )
 
-# Detail arrays.
-# Format kept intentionally human-readable:
-#   name:date:WARNING
-#   name:date:CRITICAL
-declare -a OUTDATED_DEFS=()
-declare -a OUTDATED_ENGINES=()
-
-#######################################
+###############################################################################
 # Usage
-#######################################
+###############################################################################
 usage() {
   cat <<EOF
 Usage: $SCRIPT_NAME [options]
 
 Options:
-  -t <int>    timeout curl en secondes (default: 15)
-  -u <url>    URL force (debug/test uniquement)
-  -b <path>   repertoire base des engines
-  -l <path>   repertoire de logs
-  -v          mode verbose
-  -h          aide
+  -t <int>    curl timeout in seconds (default: 15)
+  -u <url>    force URL override (debug/test only)
+  -b <path>   AV engines base directory
+  -l <path>   log directory
+  -v          verbose mode
+  -h          help
 
-Exemples:
+Examples:
   $SCRIPT_NAME
   $SCRIPT_NAME -v
   $SCRIPT_NAME -l /var/log/centreon/plugins
@@ -131,14 +151,15 @@ Exemples:
 EOF
 }
 
-#######################################
+###############################################################################
 # Logging
-#######################################
-
-# verbose on stderr to avoid polluting plugin stdout
+###############################################################################
 log() {
   local msg="$*"
 
+  # Verbose logs go to stderr only.
+  # FIX:
+  #   stdout must remain clean for Centreon plugin output.
   if [[ "$VERBOSE" -eq 1 ]]; then
     echo "$msg" >&2
   fi
@@ -155,13 +176,14 @@ init_log() {
   fi
 }
 
-#######################################
-# Helper functions
-#######################################
+###############################################################################
+# Helpers
+###############################################################################
 die() {
   local code="$1"
   shift
   local msg="$*"
+
   echo "$msg"
   log "$msg"
   exit "$code"
@@ -178,18 +200,16 @@ validate_url() {
 }
 
 cleanup_old_logs() {
+  # FIX:
+  #   Basic log retention to avoid uncontrolled disk usage.
   if [[ -n "$LOG_DIR" && -d "$LOG_DIR" ]]; then
     find "$LOG_DIR" -type f -name "supervision_*" -mtime +15 -delete 2>/dev/null || true
   fi
 }
 
-#######################################
+###############################################################################
 # Age classification
-#######################################
-# Shared logic for defs and engines:
-#   <= 24h => OK
-#   > 24h  => WARNING
-#   > 48h  => CRITICAL
+###############################################################################
 classify_age() {
   local age_seconds="$1"
 
@@ -202,9 +222,9 @@ classify_age() {
   fi
 }
 
-#######################################
-# Args
-#######################################
+###############################################################################
+# Arguments
+###############################################################################
 while getopts ":t:u:b:l:vh" opt; do
   case "$opt" in
     t) CURL_TIMEOUT="$OPTARG" ;;
@@ -218,32 +238,33 @@ while getopts ":t:u:b:l:vh" opt; do
   esac
 done
 
-#######################################
-# Argument checks
-#######################################
-validate_number "$CURL_TIMEOUT" || die "$UNKNOWN" "UNKNOWN: timeout invalide"
+###############################################################################
+# Argument validation
+###############################################################################
+validate_number "$CURL_TIMEOUT" || die "$UNKNOWN" "UNKNOWN: invalid timeout"
 
 if [[ -n "$URL_OVERRIDE" ]]; then
-  validate_url "$URL_OVERRIDE" || die "$UNKNOWN" "UNKNOWN: URL override invalide"
+  validate_url "$URL_OVERRIDE" || die "$UNKNOWN" "UNKNOWN: invalid URL override"
 fi
 
-#######################################
-# Init logs
-#######################################
+###############################################################################
+# Init
+###############################################################################
 init_log
 trap cleanup_old_logs EXIT
 
-# Fix:
-# avoid a second execution interfering with the first one
+# FIX:
+#   Prevents overlapping executions when Centreon retries while a previous run
+#   is still active.
 LOCK_FILE="/tmp/${SCRIPT_NAME}.lock"
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
-  die "$UNKNOWN" "UNKNOWN: une autre instance de ${SCRIPT_NAME} est deja en cours"
+  die "$UNKNOWN" "UNKNOWN: another instance of ${SCRIPT_NAME} is already running"
 fi
 
-#######################################
-# URL cible
-#######################################
+###############################################################################
+# Resolve target URL
+###############################################################################
 get_url() {
   if [[ -n "$URL_OVERRIDE" ]]; then
     echo "$URL_OVERRIDE"
@@ -251,53 +272,46 @@ get_url() {
   fi
 
   if [[ -z "${SERVERS_URLS[$SRV]:-}" ]]; then
-    die "$UNKNOWN" "UNKNOWN: aucune URL associee a l'hote $SRV"
+    die "$UNKNOWN" "UNKNOWN: no URL mapped for host ${SRV}"
   fi
 
   echo "${SERVERS_URLS[$SRV]}"
 }
 
-#######################################
-# HTTP defs retrieval
-#######################################
-# Notes:
-#   - curl timeout kept explicit
-#   - fail on HTTP error
-#   - both sources are concatenated in a temp file
+###############################################################################
+# Fetch definitions data through HTTP
+###############################################################################
 fetch_data() {
   local url="$1"
   local tmp="$2"
 
-  log "Fetch HTTP: ${url}${URL_PATH1}"
+  log "Fetching HTTP: ${url}${URL_PATH1}"
   curl -fsS --connect-timeout 5 --max-time "$CURL_TIMEOUT" "${url}${URL_PATH1}" > "$tmp"
 
   printf '\n' >> "$tmp"
 
-  log "Fetch HTTP: ${url}${URL_PATH2}"
+  log "Fetching HTTP: ${url}${URL_PATH2}"
   curl -fsS --connect-timeout 5 --max-time "$CURL_TIMEOUT" "${url}${URL_PATH2}" >> "$tmp"
 }
 
-#######################################
-# Defs parsing
-#######################################
-# Still depends on the actual HTML / directory listing format.
-# Kept simple on purpose for now.
+###############################################################################
+# Parse definitions HTML/page content
+###############################################################################
 parse_data() {
   local file="$1"
 
+  # FIX:
+  #   Keep parsing simple and tolerant.
+  #   grep may return no match, so "|| true" prevents strict mode failure.
   sed 's/<[^>]*>/ /g' "$file" \
     | grep -F "$WORD_KEY" \
     | grep -Fv "Index" \
     || true
 }
 
-#######################################
-# Check defs
-#######################################
-# Current business logic:
-#   - defs freshness based on age
-#   - source only gives YYYY-MM-DD
-#   - age therefore computed from YYYY-MM-DD 00:00:00
+###############################################################################
+# Check definitions
+###############################################################################
 check_defs() {
   local data="$1"
   local now_ts
@@ -316,16 +330,17 @@ check_defs() {
     date_found="$(awk '{print $2}' <<< "$line")"
 
     if [[ -z "$name" || -z "$date_found" ]]; then
-      log "DEF ignoree (ligne illisible): $line"
+      log "DEF ignored, unreadable line: $line"
       continue
     fi
 
-    # If the source date cannot be parsed, keep it critical.
+    # FIX:
+    #   Invalid date is treated as CRITICAL because freshness cannot be proven.
     if ! date_ts="$(date -d "${date_found} 00:00:00" +%s 2>/dev/null)"; then
       ((DEF_CRITICAL_COUNT+=1))
       ((DEF_COUNT+=1))
       OUTDATED_DEFS+=("${name}:${date_found}:CRITICAL")
-      log "DEF CRITICAL: ${name} (${date_found}) date invalide"
+      log "DEF CRITICAL: ${name} (${date_found}) invalid date"
       continue
     fi
 
@@ -352,25 +367,24 @@ check_defs() {
   done <<< "$data"
 }
 
-#######################################
+###############################################################################
 # Check engines
-#######################################
-# Notes:
-#   - MANIFEST timestamp is not assumed to be on first line anymore
-#   - we extract all timestamps and keep the newest one
+###############################################################################
 check_engines() {
   ENGINE_COUNT=0
   ENGINE_WARNING_COUNT=0
   ENGINE_CRITICAL_COUNT=0
   OUTDATED_ENGINES=()
 
-  [[ -d "$BASE_AV_DIR" ]] || die "$UNKNOWN" "UNKNOWN: repertoire absent: $BASE_AV_DIR"
+  [[ -d "$BASE_AV_DIR" ]] || die "$UNKNOWN" "UNKNOWN: missing directory: $BASE_AV_DIR"
 
   local now_ts
   now_ts="$(date +%s)"
 
   local d
-  # nullglob avoids treating unmatched globs as raw strings
+
+  # FIX:
+  #   nullglob avoids processing a literal '*' when no engine directory exists.
   shopt -s nullglob
   for d in "$BASE_AV_DIR"/*; do
     [[ -d "$d" ]] || continue
@@ -378,17 +392,18 @@ check_engines() {
     local engine
     engine="$(basename "$d")"
 
-    # Adjust this path if needed in your environment
     local manifest="${d}/path/MANIFEST.txt"
 
     if [[ ! -f "$manifest" ]]; then
-      log "ENGINE ${engine}: manifest absent (${manifest})"
+      log "ENGINE ${engine}: missing manifest (${manifest})"
       OUTDATED_ENGINES+=("${engine}:manifest_absent:CRITICAL")
       ((ENGINE_CRITICAL_COUNT+=1))
       ((ENGINE_COUNT+=1))
       continue
     fi
 
+    # FIX:
+    #   Extract all timestamps and keep the newest one.
     local ts
     ts="$(
       grep -i 'timestamp' "$manifest" \
@@ -398,16 +413,16 @@ check_engines() {
     )"
 
     if [[ -z "$ts" ]]; then
-      log "ENGINE ${engine}: aucun timestamp exploitable"
-      OUTDATED_ENGINES+=("${engine}:timestamp_introuvable:CRITICAL")
+      log "ENGINE ${engine}: no usable timestamp"
+      OUTDATED_ENGINES+=("${engine}:timestamp_missing:CRITICAL")
       ((ENGINE_CRITICAL_COUNT+=1))
       ((ENGINE_COUNT+=1))
       continue
     fi
 
     if [[ ! "$ts" =~ ^[0-9]+$ ]]; then
-      log "ENGINE ${engine}: timestamp invalide (${ts})"
-      OUTDATED_ENGINES+=("${engine}:timestamp_invalide:CRITICAL")
+      log "ENGINE ${engine}: invalid timestamp (${ts})"
+      OUTDATED_ENGINES+=("${engine}:timestamp_invalid:CRITICAL")
       ((ENGINE_CRITICAL_COUNT+=1))
       ((ENGINE_COUNT+=1))
       continue
@@ -439,18 +454,17 @@ check_engines() {
   shopt -u nullglob
 }
 
-#######################################
-# Build status
-#######################################
-# Final status is severity-based now:
-#   - at least one CRITICAL => CRITICAL
-#   - else at least one WARNING => WARNING
-#   - else OK
-#
-# Integration server kept softer on purpose.
+###############################################################################
+# Build final status
+###############################################################################
 build_status() {
-  if [[ "$SRV" == "$INTEGRATION_SERVER" ]]; then
-    if (( DEF_WARNING_COUNT == 0 && DEF_CRITICAL_COUNT == 0 && ENGINE_WARNING_COUNT == 0 && ENGINE_CRITICAL_COUNT == 0 )); then
+
+  # Integration server exception.
+  # FIX:
+  #   Disabled automatically if INTEGRATION_SERVER is empty.
+  if [[ -n "${INTEGRATION_SERVER:-}" && "$SRV" == "$INTEGRATION_SERVER" ]]; then
+    if (( DEF_WARNING_COUNT == 0 && DEF_CRITICAL_COUNT == 0 \
+       && ENGINE_WARNING_COUNT == 0 && ENGINE_CRITICAL_COUNT == 0 )); then
       PLUGIN_STATUS="OK"
       PLUGIN_CODE=$OK
     else
@@ -460,13 +474,29 @@ build_status() {
     return 0
   fi
 
-  if (( DEF_CRITICAL_COUNT > 0 || ENGINE_CRITICAL_COUNT > 0 )); then
+  # Priority order matters.
+  # FIX:
+  #   Engine CRITICAL threshold must be checked before defs WARNING,
+  #   otherwise a defs warning could mask a critical engine condition.
+  if (( DEF_CRITICAL_COUNT > 0 )); then
     PLUGIN_STATUS="CRITICAL"
     PLUGIN_CODE=$CRITICAL
     return 0
   fi
 
-  if (( DEF_WARNING_COUNT > 0 || ENGINE_WARNING_COUNT > 0 )); then
+  if (( ENGINE_CRITICAL_COUNT >= 4 )); then
+    PLUGIN_STATUS="CRITICAL"
+    PLUGIN_CODE=$CRITICAL
+    return 0
+  fi
+
+  if (( DEF_WARNING_COUNT > 0 )); then
+    PLUGIN_STATUS="WARNING"
+    PLUGIN_CODE=$WARNING
+    return 0
+  fi
+
+  if (( ENGINE_CRITICAL_COUNT > 0 || ENGINE_WARNING_COUNT > 0 )); then
     PLUGIN_STATUS="WARNING"
     PLUGIN_CODE=$WARNING
     return 0
@@ -476,22 +506,24 @@ build_status() {
   PLUGIN_CODE=$OK
 }
 
-#######################################
+###############################################################################
 # Main
-#######################################
+###############################################################################
 main() {
-  log "Debut ${SCRIPT_NAME} sur ${SRV}"
+  log "Starting ${SCRIPT_NAME} on ${SRV}"
 
   local url
   url="$(get_url)"
-  log "URL retenue: $url"
+  log "Selected URL: $url"
 
   local tmp
   tmp="$(mktemp)"
-  # temp file is cleaned on exit
+
+  # FIX:
+  #   Always cleanup temp file on exit.
   trap 'rm -f "$tmp"; cleanup_old_logs' EXIT
 
-  fetch_data "$url" "$tmp" || die "$CRITICAL" "CRITICAL: echec recuperation HTTP"
+  fetch_data "$url" "$tmp" || die "$CRITICAL" "CRITICAL: HTTP fetch failed"
 
   local parsed
   parsed="$(parse_data "$tmp")"
@@ -499,14 +531,12 @@ main() {
   check_defs "$parsed"
   check_engines
 
-  local defs=0
-  local engines=0
+  local defs engines
   defs="${DEF_COUNT:-0}"
   engines="${ENGINE_COUNT:-0}"
 
   build_status
 
-  # Human-readable Centreon message
   local MSG
   MSG="${PLUGIN_STATUS}: defs=${defs}, engines=${engines}"
 
@@ -517,20 +547,14 @@ main() {
 
   local d
   for d in "${OUTDATED_DEFS[@]}"; do
-    if [[ "$d" == *":WARNING" ]]; then
-      DEF_WARN_STR+="${d}, "
-    elif [[ "$d" == *":CRITICAL" ]]; then
-      DEF_CRIT_STR+="${d}, "
-    fi
+    [[ "$d" == *":WARNING" ]] && DEF_WARN_STR+="${d}, "
+    [[ "$d" == *":CRITICAL" ]] && DEF_CRIT_STR+="${d}, "
   done
 
   local e
   for e in "${OUTDATED_ENGINES[@]}"; do
-    if [[ "$e" == *":WARNING" ]]; then
-      ENG_WARN_STR+="${e}, "
-    elif [[ "$e" == *":CRITICAL" ]]; then
-      ENG_CRIT_STR+="${e}, "
-    fi
+    [[ "$e" == *":WARNING" ]] && ENG_WARN_STR+="${e}, "
+    [[ "$e" == *":CRITICAL" ]] && ENG_CRIT_STR+="${e}, "
   done
 
   DEF_WARN_STR="${DEF_WARN_STR%, }"
@@ -543,23 +567,9 @@ main() {
   [[ -n "$ENG_WARN_STR" ]] && MSG+=" | Engines WARNING: ${ENG_WARN_STR}"
   [[ -n "$ENG_CRIT_STR" ]] && MSG+=" | Engines CRITICAL: ${ENG_CRIT_STR}"
 
-  # Perfdata kept for Centreon graph / history
   echo "$MSG | defs=${defs};1;2;0 engines=${engines};1;2;0"
 
-  if [[ "$VERBOSE" -eq 1 ]]; then
-    if (( ${#OUTDATED_DEFS[@]} > 0 )); then
-      echo "Defs en cause :" >&2
-      printf '  - %s\n' "${OUTDATED_DEFS[@]}" >&2
-    fi
-
-    if (( ${#OUTDATED_ENGINES[@]} > 0 )); then
-      echo "Engines en cause :" >&2
-      printf '  - %s\n' "${OUTDATED_ENGINES[@]}" >&2
-    fi
-  fi
-
-  # Exit code is what Centreon really uses for status
-  log "Fin ${SCRIPT_NAME} sur ${SRV} (${PLUGIN_STATUS})"
+  log "Finished ${SCRIPT_NAME} on ${SRV} (${PLUGIN_STATUS})"
   exit "$PLUGIN_CODE"
 }
 
