@@ -1,0 +1,418 @@
+#!/bin/ksh
+
+# Generates an HTML antivirus update report and submits it through the local sendmail-compatible MTA.
+# The script also writes a state file consumed by check_mail.sh.
+
+MAIL_TO="mail@test.fr"
+MAIL_CC="mail2@test.fr"
+
+MAIL_FROM="Antivirus"
+SUBJECT="Etat des mises à jours des signatures et des moteurs"
+
+WORD_KEY="word_keys"
+
+URL_SUFFIX1="-word_keys-antivirus-all/"
+URL_SUFFIX2="-word_keys-antivirus.tar/"
+
+TODAY=$(date "+%Y-%m-%d")
+
+STATUS_FILE="/path/to/the/file/mail.state"
+
+typeset -A DEFS_URLS
+DEFS_URLS["server1"]="https://web/link/defs/update/"
+DEFS_URLS["server2"]="https://web/link/defs/update/"
+DEFS_URLS["server3"]="https://web/link/defs/update/"
+
+typeset -A ENGINE_URLS
+ENGINE_URLS["server1"]="https://web/link/engines/update/"
+ENGINE_URLS["server2"]="https://web/link/engines/update/"
+ENGINE_URLS["server3"]="https://web/link/engines/update/"
+
+ENGINES="
+engines1
+engines2
+engines3
+"
+
+ENGINE_OLD_CRITICAL_THRESHOLD=4
+
+SERVERS="
+server1
+server2
+server3
+"
+
+# Render an HTML status badge.
+html_status()
+{
+  STATUS="$1"
+
+  if [ "$STATUS" = "OK" ]; then
+    echo "<span style='color:green;font-weight:bold;'>OK</span>"
+  else
+    echo "<span style='color:red;font-weight:bold;'>KO</span>"
+  fi
+}
+
+# Detect the latest available antivirus repository version from a directory listing.
+detect_word_keys_version()
+{
+  BASE_URL="$1"
+
+  curl -ks \
+    --connect-timeout 10 \
+    --max-time 30 \
+    "${BASE_URL%/}/" 2>/dev/null \
+    | grep -oE '[0-9]+(\.[0-9]+)*-word_keys-antivirus-all/' \
+    | sed 's/-word_keys-antivirus-all\/$//' \
+    | sort -V \
+    | tail -1
+}
+
+# Validate definition files exposed by a repository URL.
+check_defs_url()
+{
+  URL="$1"
+
+  TMP_FILE="/tmp/check_defs_$$.tmp"
+  KO_FILE="/tmp/check_defs_ko_$$.tmp"
+
+  rm -f "$TMP_FILE" "$KO_FILE"
+
+  curl -ks "$URL" > "$TMP_FILE"
+
+  if [ ! -s "$TMP_FILE" ]; then
+    rm -f "$TMP_FILE" "$KO_FILE"
+    echo "KO|Page vide ou inaccessible"
+    return
+  fi
+  sed 's/<[^>]*>/ /g' "$TMP_FILE" \
+    | grep -F "$WORD_KEY" \
+    | grep -Fv "Index" \
+    | while read line
+      do
+        NAME=$(echo "$line" | awk '{print $1}')
+        DATE_FOUND=$(echo "$line" | awk '{print $2}')
+
+        [ -z "$NAME" ] && continue
+        [ -z "$DATE_FOUND" ] && continue
+
+        FILE_DATE=$(date -d "${DATE_FOUND} 00:00:00" "+%Y-%m-%d" 2>/dev/null)
+
+        if [ -z "$FILE_DATE" ]; then
+          echo "${NAME}: date non exploitable (${DATE_FOUND})" >> "$KO_FILE"
+          continue
+        fi
+
+        if [ "$FILE_DATE" != "$TODAY" ]; then
+          echo "${NAME}: date=${FILE_DATE}" >> "$KO_FILE"
+        fi
+      done
+
+  rm -f "$TMP_FILE"
+
+  if [ -s "$KO_FILE" ]; then
+    DETAIL=$(awk '{printf "%s%s", sep, $0; sep=" ; "}' "$KO_FILE")
+    rm -f "$KO_FILE"
+    echo "KO|${DETAIL}"
+  else
+    rm -f "$KO_FILE"
+    echo "OK|"
+  fi
+}
+
+# Validate one engine package and confirm that it is referenced by MANIFEST.txt.
+check_engine_url()
+{
+  SERVER="$1"
+  ENGINE="$2"
+  URL="$3"
+
+  TMP_PAGE="/tmp/check_engine_page_${SERVER}_${ENGINE}_$$.tmp"
+  TMP_MANIFEST="/tmp/check_engine_manifest_${SERVER}_${ENGINE}_$$.tmp"
+
+  rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+
+  curl -ks "$URL" > "$TMP_PAGE"
+
+  if [ ! -s "$TMP_PAGE" ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "KO|Page engine inaccessible"
+    return
+  fi
+
+  LINE=$(sed 's/<[^>]*>/ /g' "$TMP_PAGE" \
+    | grep -E '\.tar\.gz' \
+    | grep -Fv "Index" \
+    | head -1)
+
+  if [ -z "$LINE" ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "KO|Aucun fichier .tar.gz trouve"
+    return
+  fi
+
+  FILE_NAME=$(echo "$LINE" | awk '{print $1}')
+  DATE_FOUND=$(echo "$LINE" | awk '{print $2}')
+
+  if [ -z "$FILE_NAME" ] || [ -z "$DATE_FOUND" ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "KO|Nom fichier ou date introuvable"
+    return
+  fi
+
+  FILE_TS=$(date -d "${DATE_FOUND} 00:00:00" "+%s" 2>/dev/null)
+
+  if [ -z "$FILE_TS" ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "KO|Date non exploitable pour ${FILE_NAME}"
+    return
+  fi
+
+  NOW_TS=$(date "+%s")
+  AGE_SECONDS=$((NOW_TS - FILE_TS))
+
+  if [ "$AGE_SECONDS" -gt $((48 * 3600)) ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "OLD|${FILE_NAME} trop ancien date=${DATE_FOUND}"
+    return
+  fi
+  MANIFEST_URL="${URL}MANIFEST.txt"
+  curl -ks "$MANIFEST_URL" > "$TMP_MANIFEST"
+
+  if [ ! -s "$TMP_MANIFEST" ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "KO|MANIFEST.txt inaccessible"
+    return
+  fi
+
+  grep -F "$FILE_NAME" "$TMP_MANIFEST" >/dev/null 2>&1
+
+  if [ $? -ne 0 ]; then
+    rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+    echo "KO|${FILE_NAME} absent du MANIFEST.txt"
+    return
+  fi
+
+  rm -f "$TMP_PAGE" "$TMP_MANIFEST"
+  echo "OK|${ENGINE}: ${FILE_NAME}"
+}
+
+{
+echo "To: ${MAIL_TO}"
+echo "From: ${MAIL_FROM}"
+echo "CC: ${MAIL_CC}"
+echo "Subject: ${SUBJECT}"
+echo "MIME-Version: 1.0"
+echo "Content-Type: text/html; charset=UTF-8"
+echo ""
+
+echo "<html>"
+echo "<body style='font-family:Arial, sans-serif;font-size:13px;'>"
+
+echo "<p style='font-size:12px;color:#555;'>Controle genere le : $(date '+%Y-%m-%d %H:%M:%S')</p>"
+
+echo "<table width='100%' cellpadding='4' cellspacing='0' border='1' style='border-collapse:collapse;'>"
+
+echo "<tr style='background-color:#0B1F3A;color:white;font-weight:bold;'>"
+echo "<td colspan='4'>Resume</td>"
+echo "</tr>"
+
+echo "<tr>"
+echo "<td colspan='4'>"
+echo "<b>Object du controle :</b> Verification que les signatures antivirus sont bien a la date du jour<br>"
+echo "<b>Status check :</b> <span style='color:green;font-weight:bold;'>OK</span> ou <span style='color:red;font-weight:bold;'>KO</span>"
+echo "</td>"
+echo "</tr>"
+
+echo "<tr style='background-color:#0B1F3A;color:white;font-weight:bold;'>"
+echo "<th width='140'>Server</th>"
+echo "<th width='450'>Link</th>"
+echo "<th width='450'>Description</th>"
+echo "<th width='120'>Status</th>"
+echo "</tr>"
+
+for SERVER in $SERVERS
+do
+  BASE_URL="${DEFS_URLS[$SERVER]}"
+
+  ANTIVIRUS_VERSION=$(detect_word_keys_version "$BASE_URL")
+
+  if [ -z "$ANTIVIRUS_VERSION" ]; then
+    LINK1="${BASE_URL%/}/"
+    LINK2="${BASE_URL%/}/"
+
+    RET1="KO|Version antivirus non detectee sur le depot"
+    RET2="KO|Version antivirus non detectee sur le depot"
+  else
+    URL_PATH1="${ANTIVIRUS_VERSION}${URL_SUFFIX1}"
+    URL_PATH2="${ANTIVIRUS_VERSION}${URL_SUFFIX2}"
+
+    LINK1="${BASE_URL%/}/${URL_PATH1}"
+    LINK2="${BASE_URL%/}/${URL_PATH2}"
+
+    RET1=$(check_defs_url "$LINK1")
+    RET2=$(check_defs_url "$LINK2")
+  fi
+
+
+  STATUS1=$(echo "$RET1" | awk -F'|' '{print $1}')
+  DETAIL1=$(echo "$RET1" | awk -F'|' '{print $2}')
+
+  STATUS2=$(echo "$RET2" | awk -F'|' '{print $1}')
+  DETAIL2=$(echo "$RET2" | awk -F'|' '{print $2}')
+
+  DESC1="verifier que tous les .tar et .sig sont a la date du jour dans ce dossier"
+  DESC2="verifier que le .tar et le .sig sont a la date du jour"
+  if [ "$STATUS1" = "KO" ] && [ -n "$DETAIL1" ]; then
+    DESC1="${DESC1}<br><span style='color:red;font-weight:bold;'>Details KO :</span> ${DETAIL1}"
+  fi
+
+  if [ "$STATUS2" = "KO" ] && [ -n "$DETAIL2" ]; then
+    DESC2="${DESC2}<br><span style='color:red;font-weight:bold;'>Details KO :</span> ${DETAIL2}"
+  fi
+
+  echo "<tr>"
+  echo "<td rowspan='2' style='vertical-align:top;font-weight:bold;'>[${SERVER}]</td>"
+  echo "<td><a href='${LINK1}'>${LINK1}</a></td>"
+  echo "<td>${DESC1}</td>"
+  echo "<td style='text-align:center;'>$(html_status "$STATUS1")</td>"
+  echo "</tr>"
+
+  echo "<tr>"
+  echo "<td><a href='${LINK2}'>${LINK2}</a></td>"
+  echo "<td>${DESC2}</td>"
+  echo "<td style='text-align:center;'>$(html_status "$STATUS2")</td>"
+  echo "</tr>"
+done
+
+echo "</table>"
+
+echo "<br>"
+echo "<table width='100%' cellpadding='4' cellspacing='0' border='1' style='border-collapse:collapse;'>"
+
+echo "<tr style='background-color:#0B1F3A;color:white;font-weight:bold;'>"
+echo "<td colspan='4'>Resume</td>"
+echo "</tr>"
+
+echo "<tr>"
+echo "<td colspan='4'>"
+echo "<b>Object du controle :</b> Controler la bonne integration des signatures antivirales des moteurs avec le fichier manifest.<br>"
+echo "En cas de <span style='color:red;font-weight:bold;'>KO</span>, ouvrir un incident et verifier le moteur concerne.<br>"
+echo "<b>Status check :</b> <span style='color:green;font-weight:bold;'>OK</span> ou <span style='color:red;font-weight:bold;'>KO</span>"
+echo "</td>"
+echo "</tr>"
+
+echo "<tr style='background-color:#0B1F3A;color:white;font-weight:bold;'>"
+echo "<th width='140'>Server</th>"
+echo "<th width='450'>Link</th>"
+echo "<th width='450'>Description</th>"
+echo "<th width='120'>Status</th>"
+echo "</tr>"
+
+for SERVER in $SERVERS
+do
+  BASE_URL="${ENGINE_URLS[$SERVER]}"
+
+  SERVER_STATUS="OK"
+  LINKS_HTML=""
+
+  OLD_ENGINE_COUNT=0
+
+  TECHNICAL_KO_COUNT=0
+
+  DETAILS_OLD=""
+  DETAILS_KO=""
+
+  for ENGINE in $ENGINES
+  do
+    ENGINE_URL="${BASE_URL}/path/web/to/the/${ENGINE}/web/"
+    RET=$(check_engine_url "$SERVER" "$ENGINE" "$ENGINE_URL")
+
+    STATUS=$(echo "$RET" | awk -F'|' '{print $1}')
+
+    DETAIL=$(echo "$RET" | cut -d'|' -f2-)
+
+    LINKS_HTML="${LINKS_HTML}<a href='${ENGINE_URL}'>${ENGINE_URL}</a><br>"
+
+    case "$STATUS" in
+
+      OK)
+        ;;
+
+      OLD)
+        OLD_ENGINE_COUNT=$((OLD_ENGINE_COUNT + 1))
+
+        DETAILS_OLD="${DETAILS_OLD}<br><span style='color:#CC7A00;font-weight:bold;'>${ENGINE}:</span> ${DETAIL}"
+        ;;
+
+      KO)
+        TECHNICAL_KO_COUNT=$((TECHNICAL_KO_COUNT + 1))
+        SERVER_STATUS="KO"
+
+        DETAILS_KO="${DETAILS_KO}<br><span style='color:red;font-weight:bold;'>${ENGINE}:</span> ${DETAIL}"
+        ;;
+
+      *)
+        TECHNICAL_KO_COUNT=$((TECHNICAL_KO_COUNT + 1))
+        SERVER_STATUS="KO"
+
+        DETAILS_KO="${DETAILS_KO}<br><span style='color:red;font-weight:bold;'>${ENGINE}:</span> Statut non reconnu (${STATUS})"
+        ;;
+    esac
+  done
+
+  if [ "$OLD_ENGINE_COUNT" -ge "$ENGINE_OLD_CRITICAL_THRESHOLD" ]; then
+    SERVER_STATUS="KO"
+  fi
+
+  DESC="Verifier que le nom du fichier *.tar.gz soit bien a la date du jour ou J-1 max (&lt;48h) et que ce nom de fichier se trouve bien dans le fichier <b>MANIFEST.txt</b> de chaque moteur."
+
+  if [ "$OLD_ENGINE_COUNT" -gt 0 ] && \
+     [ "$OLD_ENGINE_COUNT" -lt "$ENGINE_OLD_CRITICAL_THRESHOLD" ]; then
+
+    DESC="${DESC}<br><br><span style='color:#CC7A00;font-weight:bold;'>Information :</span> ${OLD_ENGINE_COUNT} moteur(s) depasse(nt) le seuil de 48h. Le serveur reste en OK tant que moins de ${ENGINE_OLD_CRITICAL_THRESHOLD} moteurs sont concernes.${DETAILS_OLD}"
+  fi
+
+  if [ "$OLD_ENGINE_COUNT" -ge "$ENGINE_OLD_CRITICAL_THRESHOLD" ]; then
+
+    DESC="${DESC}<br><br><span style='color:red;font-weight:bold;'>Details KO :</span> ${OLD_ENGINE_COUNT} moteur(s) depasse(nt) le seuil de 48h. Le seuil de passage en KO est fixe a ${ENGINE_OLD_CRITICAL_THRESHOLD}.${DETAILS_OLD}"
+  fi
+
+  if [ "$TECHNICAL_KO_COUNT" -gt 0 ]; then
+
+    DESC="${DESC}<br><br><span style='color:red;font-weight:bold;'>Erreurs techniques :</span>${DETAILS_KO}"
+  fi
+
+  echo "<tr>"
+  echo "<td style='vertical-align:top;font-weight:bold;'>[${SERVER}]</td>"
+  echo "<td>${LINKS_HTML}</td>"
+  echo "<td>${DESC}</td>"
+  echo "<td style='text-align:center;vertical-align:top;'>$(html_status "$SERVER_STATUS")</td>"
+  echo "</tr>"
+done
+echo "</table>"
+
+
+echo "</body>"
+echo "</html>"
+
+} | /usr/sbin/sendmail -t
+
+SENDMAIL_RC=$?
+if [ "$SENDMAIL_RC" -eq 0 ]; then
+  cat > "$STATUS_FILE" << EOF
+LAST_RUN="$(date '+%Y-%m-%d %H:%M:%S')"
+LAST_STATUS="OK"
+LAST_RC="0"
+LAST_MESSAGE="Automatic report successfully submitted to the mail transport service"
+EOF
+else
+  cat > "$STATUS_FILE" << EOF
+LAST_RUN="$(date '+%Y-%m-%d %H:%M:%S')"
+LAST_STATUS="KO"
+LAST_RC="$SENDMAIL_RC"
+LAST_MESSAGE="Automatic report submission tothe mail transport service failed"
+EOF
+fi
+exit "$SENDMAIL_RC"
